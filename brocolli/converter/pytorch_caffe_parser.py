@@ -312,6 +312,9 @@ class PytorchCaffeParser:
                 elif function_name == "prelu":
                     layer_data = self.rename_prelu(node)
                     self.layers.append(layer_data)
+                elif function_name == "tanh":
+                    layer_data = self.rename_tanh(node)
+                    self.layers.append(layer_data)
                 elif function_name == "hardtanh":
                     layer_data = self.rename_hardtanh(node)
                     self.layers.append(layer_data)
@@ -1540,5 +1543,13 @@ class PytorchCaffeParser:
         layer.top.append(source_node.name)
         layer.top.append(source_node.name + "_index1")
         layer.name = source_node.name
+
+        return layer
+
+    def rename_tanh(self, source_node):
+        layer = pb2.LayerParameter()
+        layer.type = "TanH"
+
+        self.add_bottom_top(layer, source_node)
 
         return layer
