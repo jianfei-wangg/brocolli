@@ -234,7 +234,13 @@ class PytorchQuantizer:
 
             function_name = get_function_name(node.target)
             if function_name == "add":
-                return False
+                return True
+            elif function_name == "sub":
+                return True
+            elif function_name == "mul":
+                return True
+            elif function_name == "cat":
+                return True
             else:
                 return False
         elif node.op == "output":
@@ -281,6 +287,7 @@ class PytorchQuantizer:
                     user.replace_input_with(node, new_node)
 
         self.observed_model = BrocolliGraphModule(graph_module, graph_module.graph)
+        self.print_tabular(self.observed_model)
 
     def prepare_finetune(self):
         graph_module = copy.deepcopy(self.observed_model)
@@ -309,21 +316,60 @@ class PytorchQuantizer:
         logger.info("calibtraion start")
         calibtraion_func(self.observed_model)
         logger.info("calibtraion finish")
+        self.graph_module_to_export = self.observed_model
 
     def lsq(self, calibtraion_func):
         if hasattr(self, "fused_model"):
             float_module = copy.deepcopy(self.fused_model)
         else:
             float_module = copy.deepcopy(self.graph_module)
-            
+
         for name, param in self.finetune_model.named_parameters():
             if not "observer" in name:
-                param.requires_grad_(False)            
-               
+                param.requires_grad_(False)
+
         logger.info("lsq start")
-        lsq_module = LSQER(float_module.eval(), self.finetune_model)
-        calibtraion_func(lsq_module)
+        lsqer = LSQER(float_module.eval(), self.finetune_model)
+        calibtraion_func(lsqer)
         logger.info("lsq finish")
+        with torch.no_grad():
+            logger.info("lsq evaluation start")
+            calibtraion_func(lsqer.lsq_module)
+            logger.info("lsq evaluation finish")
+
+        self.graph_module_to_export = lsqer.lsq_module
+
+    def export_graph(self, json_path, onnx_path):
+        graph_module = copy.deepcopy(self.graph_module_to_export)
+        modules = dict(graph_module.named_modules())
+
+        import json
+
+        json_dict = {}
+        for node in list(graph_module.graph.nodes):
+            if node.op == "call_module" and node.type == "observer":
+                module = modules[node.target]
+                name = node.name.split("_observer")[0]
+                json_dict[name] = {}
+                json_dict[name]["scale"] = float(module.calculate_qparams())
+                json_dict[name]["min"] = float(module.min_val)
+                json_dict[name]["max"] = float(module.max_val)
+                json_dict[name]["bitwidth"] = 8
+
+        json_object = json.dumps(json_dict, indent=4)
+        with open(f"{json_path}", "w") as outfile:
+            outfile.write(json_object)
+
+        for node in list(graph_module.graph.nodes):  # remove observer
+            if node.op == "call_module" and node.type == "observer":
+                assert len(node.all_input_nodes) == 1
+                input_node = node.all_input_nodes[0]
+                node.replace_all_uses_with(input_node)
+                graph_module.graph.erase_node(node)
+
+        export_module = BrocolliGraphModule(graph_module, graph_module.graph)
+        dummy_input = self.gen_input_tensor(self.input_shape)
+        torch.onnx.export(export_module, (*dummy_input,), onnx_path)
 
     def find_input_observer_node(self, node):
         if node.type == "observer":
