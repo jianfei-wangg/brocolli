@@ -81,7 +81,7 @@ def plot_hist(module, float_node, quant_node, quanted_name):
         plt.title(
             f"{quanted_name} float weight, shape:{module.float_weight.shape}", wrap=True
         )
-        plt.hist(module.float_weight.flatten().numpy(), bins=256)
+        plt.hist(module.float_weight.cpu().flatten().numpy(), bins=256)
         plt.subplot(2, 2, 2)
         plt.title(
             f"{quanted_name} quantization weight, shape:{module.weight.shape}",
@@ -89,16 +89,17 @@ def plot_hist(module, float_node, quant_node, quanted_name):
         )
         plt.hist(
             (module.weight.permute(1, 2, 3, 0) * module.wt_scale.flatten(0))
+            .cpu()
             .flatten()
             .numpy(),
             bins=256,
         )
         plt.subplot(2, 2, 3)
         plt.title(f"{quanted_name} float data, shape:{float_shape}", wrap=True)
-        plt.hist(float_data.flatten().numpy(), bins=256)
+        plt.hist(float_data.cpu().flatten().numpy(), bins=256)
         plt.subplot(2, 2, 4)
         plt.title(f"{quanted_name} quantization data, shape:{quant_shape}", wrap=True)
-        plt.hist(quant_data.flatten().numpy(), bins=256)
+        plt.hist(quant_data.cpu().flatten().numpy(), bins=256)
         plt.ioff()
         plt.tight_layout(pad=2, w_pad=3, h_pad=3)
         plt.show()
@@ -119,10 +120,10 @@ def plot_hist(module, float_node, quant_node, quanted_name):
         plt.figure(frameon=False, clear=True)
         plt.subplot(1, 2, 1)
         plt.title(f"{quanted_name} float data, shape:{float_shape}", wrap=True)
-        plt.hist(float_data.flatten().numpy(), bins=256)
+        plt.hist(float_data.cpu().flatten().numpy(), bins=256)
         plt.subplot(1, 2, 2)
         plt.title(f"{quanted_name} quantization data, shape:{quant_shape}", wrap=True)
-        plt.hist(quant_data.flatten().numpy(), bins=256)
+        plt.hist(quant_data.cpu().flatten().numpy(), bins=256)
         plt.ioff()
         plt.tight_layout(pad=2, w_pad=3, h_pad=3)
         plt.show()
