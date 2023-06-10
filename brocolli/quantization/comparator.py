@@ -50,3 +50,7 @@ class FXComparator(Interpreter):
     def eval(self):
         self.module.eval()
         return self
+    
+    def to(self, device):
+        self.module.to(device)
+        return self    
