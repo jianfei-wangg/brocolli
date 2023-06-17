@@ -29,45 +29,24 @@ class Linear(nn.Module, BaseOperator):
     @classmethod
     def from_float(cls, mod):
         assert hasattr(
-            mod.activation_pre_process, "qconfig"
+            mod, "qconfig"
         ), "Conv float module must have qconfig defined."
-        weight_post_process = mod.activation_pre_process.qconfig.weight()
-        weight_post_process(mod.weight)
-        qweight, wt_scale = _quantize_weight(mod.weight.float(), weight_post_process)
-        act_scale = mod.activation_pre_process.calculate_qparams()
-        logger.debug(
-            f"{mod.name} activation scale: {act_scale}, max_val: {mod.activation_pre_process.max_val}, min_val: {mod.activation_pre_process.min_val}"
-        )
-        qbias = (
-            _quantize_bias(mod.bias.float(), wt_scale * act_scale)
-            if mod.bias is not None
-            else None
-        )
-        output_scale = mod.activation_post_process.calculate_qparams()
-        logger.debug(
-            f"{mod.name} output scale: {output_scale}, max_val: {mod.activation_post_process.max_val}, min_val: {mod.activation_post_process.min_val}"
-        )
-        qlinear = cls(mod.in_features, mod.out_features, mod.bias)
+        weight_observer = mod.qconfig.weight()
+        weight_observer(mod.weight)
 
-        qlinear.qbit = mod.activation_pre_process.qbit
-        qlinear.weight = torch.nn.Parameter(qweight, requires_grad=False)
-        qlinear.bias = torch.nn.Parameter(qbias, requires_grad=False)
-        qlinear.act_scale = torch.nn.Parameter(act_scale, requires_grad=False).to(qweight.device)
-        qlinear.wt_scale = torch.nn.Parameter(wt_scale.reshape(1, -1), requires_grad=False).to(qweight.device)
-        qlinear.output_scale = torch.nn.Parameter(output_scale, requires_grad=False).to(qweight.device)
-        qlinear.output_min_value = mod.activation_post_process.min_val
-        qlinear.output_max_value = mod.activation_post_process.max_val
+        qlinear = cls(mod.in_features, mod.out_features, mod.bias)
+        qlinear.weight_observer = weight_observer
+        qlinear.weight = torch.nn.Parameter(mod.weight, requires_grad=False)
+        if mod.bias is not None:
+            qlinear.bias = torch.nn.Parameter(mod.bias, requires_grad=False)
 
         return qlinear
 
     def forward(self, input):
         out = F.linear(
-            input.to(torch.float32),
-            self.weight.to(torch.float32),
-            self.bias.to(torch.float32),
+            input,
+            self.weight_observer(self.weight),
+            self.bias,
         )
-
-        out = out * self.act_scale * self.wt_scale / self.output_scale
-        out = self.clamp(out)
 
         return out
