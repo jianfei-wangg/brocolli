@@ -37,9 +37,9 @@ def _with_args(cls_or_self, **kwargs):
 
 
 class ObserverBase(ABC, nn.Module):
-    def __init__(self, dtype):
+    def __init__(self, bit):
         super(ObserverBase, self).__init__()
-        self.dtype = dtype
+        self.bit = bit
 
     @abstractmethod
     def forward(self, x):
@@ -59,15 +59,11 @@ class _ObserverBase(ObserverBase):
 
     def __init__(
         self,
-        dtype=torch.quint8,
-        qscheme=torch.per_tensor_affine,
-        factory_kwargs=None,
+        bit=8,
     ):
-        factory_kwargs = torch.nn.factory_kwargs(factory_kwargs)
-        super(_ObserverBase, self).__init__(dtype=dtype)
-        self.qscheme = qscheme
+        super(_ObserverBase, self).__init__(bit=bit)
         self.register_buffer(
-            "eps", torch.tensor([torch.finfo(torch.float32).eps], **factory_kwargs)
+            "eps", torch.tensor([torch.finfo(torch.float32).eps])
         )
         self.input_shape = None
         self.lsq_enabled = False
@@ -94,39 +90,9 @@ class _ObserverBase(ObserverBase):
 
     @torch.jit.export
     def _calculate_qmin_qmax(self):
-        if self.dtype == torch.qint8:
-            quant_min, quant_max = -127, 127
-        elif self.dtype == torch.quint8:
-            quant_min, quant_max = 0, 255
+        quant_min, quant_max = -127, 127
 
         return quant_min, quant_max
-
-    @torch.jit.export
-    def _calculate_qparams(self, min_val: torch.Tensor, max_val: torch.Tensor):
-        quant_min, quant_max = self._calculate_qmin_qmax()
-        min_val_neg = torch.min(min_val, torch.zeros_like(min_val))
-        max_val_pos = torch.max(max_val, torch.zeros_like(max_val))
-
-        scale = torch.ones(min_val_neg.size(), dtype=torch.float32)
-
-        if (
-            self.qscheme == torch.per_tensor_symmetric
-            or self.qscheme == torch.per_channel_symmetric
-        ):
-            max_val_pos = torch.max(-min_val_neg, max_val_pos)
-            scale = max_val_pos / (float(quant_max - quant_min) / 2)
-            scale = torch.max(scale, self.eps)
-        elif self.qscheme == torch.per_channel_affine_float_qparams:
-            scale = (max_val - min_val) / float(quant_max - quant_min)
-            scale = torch.where(scale > self.eps, scale, torch.ones_like(scale))
-        else:
-            scale = (max_val_pos - min_val_neg) / float(quant_max - quant_min)
-            scale = torch.max(scale, self.eps)
-
-        if len(scale.shape) == 0:
-            scale = torch.tensor([float(scale)], dtype=scale.dtype)
-
-        return scale
 
     def enable_lsq(self):
         self.lsq_scale = nn.Parameter(self.scale)
@@ -143,19 +109,12 @@ class MinMaxObserver(_ObserverBase):
     max_val: torch.Tensor
 
     def __init__(
-        self,
-        dtype=torch.quint8,
-        qscheme=torch.per_tensor_affine,
-        factory_kwargs=None,
+        self, bit=8,
     ):
-        super(MinMaxObserver, self).__init__(
-            dtype=dtype,
-            qscheme=qscheme,
-            factory_kwargs=factory_kwargs,
+        super(MinMaxObserver, self).__init__(bit=bit,
         )
-        factory_kwargs = torch.nn.factory_kwargs(factory_kwargs)
-        self.register_buffer("min_val", torch.tensor(float("inf"), **factory_kwargs))
-        self.register_buffer("max_val", torch.tensor(float("-inf"), **factory_kwargs))
+        self.register_buffer("min_val", torch.tensor(float("inf")))
+        self.register_buffer("max_val", torch.tensor(float("-inf")))
 
     def forward(self, x_orig):
         if self.lsq_enabled:
@@ -196,22 +155,11 @@ class PerChannelMinMaxObserver(_ObserverBase):
     min_vals: torch.Tensor
     max_vals: torch.Tensor
 
-    def __init__(
-        self,
-        ch_axis=0,
-        dtype=torch.quint8,
-        qscheme=torch.per_channel_affine,
-        factory_kwargs=None,
-    ):
-        super(PerChannelMinMaxObserver, self).__init__(
-            dtype=dtype,
-            qscheme=qscheme,
-            factory_kwargs=factory_kwargs,
-        )
-        factory_kwargs = torch.nn.factory_kwargs(factory_kwargs)
+    def __init__(self, ch_axis=0, bit=8):
+        super(PerChannelMinMaxObserver, self).__init__(bit=bit)
         self.ch_axis = ch_axis
-        self.register_buffer("min_vals", torch.tensor([], **factory_kwargs))
-        self.register_buffer("max_vals", torch.tensor([], **factory_kwargs))
+        self.register_buffer("min_vals", torch.tensor([]))
+        self.register_buffer("max_vals", torch.tensor([]))
 
     def forward(self, x_orig):
         self.input_shape = x_orig.shape
@@ -245,13 +193,24 @@ class PerChannelMinMaxObserver(_ObserverBase):
 
     @torch.jit.export
     def calculate_qparams(self):
-        return self._calculate_qparams(self.min_vals, self.max_vals)
+        quant_min, quant_max = self._calculate_qmin_qmax()
+        min_val_neg = torch.min(self.min_vals, torch.zeros_like(self.min_vals))
+        max_val_pos = torch.max(self.max_vals, torch.zeros_like(self.max_vals))
+
+        scale = torch.ones(min_val_neg.size(), dtype=torch.float32)
+
+        max_val_pos = torch.max(-min_val_neg, max_val_pos)
+        scale = max_val_pos / (float(quant_max - quant_min) / 2)
+        scale = torch.max(scale, self.eps)
+
+        if len(scale.shape) == 0:
+            scale = torch.tensor([float(scale)], dtype=scale.dtype)
+
+        return scale
 
     def extra_repr(self):
         return "min_val={}, max_val={}".format(self.min_vals, self.max_vals)
 
 
-default_observer = MinMaxObserver.with_args(qscheme=torch.per_tensor_symmetric)
-default_weight_observer = PerChannelMinMaxObserver.with_args(
-    dtype=torch.qint8, qscheme=torch.per_channel_symmetric
-)
+default_observer = MinMaxObserver.with_args()
+default_weight_observer = PerChannelMinMaxObserver.with_args(bit=8)
