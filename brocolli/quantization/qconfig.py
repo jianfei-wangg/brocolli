@@ -15,24 +15,16 @@ class QConfig(namedtuple("QConfig", ["activation", "weight"])):
         return super(QConfig, cls).__new__(cls, activation, weight)
 
 
-def get_qconfig(bit, input_dtype=torch.qint8, lsq=False):
+def get_qconfig(bit):
     if bit == 8:
         return QConfig(
-            activation=MinMaxObserver.with_args(
-                dtype=input_dtype, qscheme=torch.per_tensor_symmetric
-            ),
-            weight=PerChannelMinMaxObserver.with_args(
-                dtype=torch.qint8, qscheme=torch.per_channel_symmetric
-            ),
+            activation=MinMaxObserver.with_args(bit=bit),
+            weight=PerChannelMinMaxObserver.with_args(bit=bit),
         )
     elif bit == 16:
         return QConfig(
-            activation=MinMaxObserver.with_args(
-                dtype=input_dtype, qscheme=torch.per_tensor_symmetric
-            ),
-            weight=PerChannelMinMaxObserver.with_args(
-                dtype=torch.qint8, qscheme=torch.per_channel_symmetric
-            ),
+            activation=MinMaxObserver.with_args(bit=bit),
+            weight=PerChannelMinMaxObserver.with_args(bit=bit),
         )
     else:
         raise ValueError("Quantization bit {} is not supported".format(bit))
