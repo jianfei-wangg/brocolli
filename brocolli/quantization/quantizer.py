@@ -260,8 +260,11 @@ class PytorchQuantizer:
 
         modules = dict(graph_module.named_modules())
         for node in list(graph_module.graph.nodes):
+            qconfig = get_qconfig(8)
             if node.op == "call_module":
                 module = modules[node.target]
+                module.name = node.name
+                module.qconfig = qconfig
                 target_atoms = node.target.split(".")
                 target = "_".join(target_atoms)
                 match = re.findall(r"{}(_+\d)".format(str(target)), node.name)
@@ -272,9 +275,18 @@ class PytorchQuantizer:
                         graph_module.add_submodule(node_target, module)
                         node.target = node_target
 
+                if isinstance(module, (nn.Conv2d, nn.Conv1d)):
+                    transformed = Conv2d.from_float(module)
+                elif isinstance(module, nn.Linear):
+                    transformed = Linear.from_float(module)
+                else:
+                    transformed = module
+
+                with graph_module.graph.inserting_after(node):
+                    replace_node_module(node, modules, transformed)
+
             if self._is_observer_needed(node, graph_module, self.quant_ops, lsq):
                 users = list(node.users)
-                qconfig = get_qconfig(8, lsq=lsq)
                 observer_module = qconfig.activation()
                 observer_module.qconfig = qconfig
                 observer_module.qbit = 8
@@ -355,6 +367,15 @@ class PytorchQuantizer:
                 json_dict[name]["min"] = float(module.min_val)
                 json_dict[name]["max"] = float(module.max_val)
                 json_dict[name]["bitwidth"] = 8
+            elif node.op == "call_module":
+                module = modules[node.target]
+                name = node.name.split("_observer")[0]
+                if isinstance(module, Conv2d) or isinstance(module, Linear):
+                    json_dict[name+'_weight'] = {}
+                    json_dict[name+'_weight']["scale"] = module.weight_observer.calculate_qparams().numpy().tolist()
+                    json_dict[name+'_weight']["min"] = module.weight_observer.min_vals.numpy().tolist()
+                    json_dict[name+'_weight']["max"] = module.weight_observer.max_vals.numpy().tolist()
+                    json_dict[name+'_weight']["bitwidth"] = 8
 
         json_object = json.dumps(json_dict, indent=4)
         with open(f"{json_path}", "w") as outfile:
