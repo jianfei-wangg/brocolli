@@ -84,13 +84,6 @@ class _ConvNd(nn.Module):
             s += ", bias=False"
         return s.format(**self.__dict__)
 
-    def __deepcopy__(self, memo):
-        new_instance = type(self).__new__(type(self))
-        torch.nn.Module.__init__(new_instance)
-        state = self.__getstate__()
-        new_instance.__setstate__(state)
-        return new_instance
-
     def __copy__(self):
         return self.__deepcopy__({})
 
