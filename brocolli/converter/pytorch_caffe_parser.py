@@ -1,9 +1,9 @@
 import numpy as np
 from loguru import logger
 from brocolli.converter.pytorch_graph import PytorchGraph
-import caffe.proto.caffe_pb2 as pb2
+# import caffe.proto.caffe_pb2 as pb2
+from brocolli.converter.ppl_caffe import caffe_pb2 as pb2
 
-import caffe
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +12,7 @@ from torch.fx.node import Node
 from torch.fx.graph_module import GraphModule
 import google.protobuf.text_format
 from .common_utils import get_function_name
+import os
 
 
 def as_blob(array):
@@ -30,6 +31,7 @@ class PytorchCaffeParser:
             self.inputs = [self.inputs]
         self.fuse = fuse
         self.concrete_args = concrete_args
+        self.whether_3dnet = False
 
         if isinstance(self.model, GraphModule):
             pass
@@ -144,24 +146,36 @@ class PytorchCaffeParser:
         layer.name = source_node.name
 
     def gen_ir(self):
+        text_net = pb2.NetParameter()
+        binary_weights = pb2.NetParameter()
         for node in self.pytorch_graph.nodes:
             if node.op == "placeholder":
-                layer_data = self.rename_Data(node)
-                self.layers.append(layer_data)
+                self.rename_Data(node, text_net)
+                # layer_data = self.rename_Data(node)
+                # self.layers.append(layer_data)
             elif node.op == "call_module":
                 module = self.modules[node.target]
                 if isinstance(module, nn.Conv2d):
                     layer_data = self.rename_Conv(node, module)
                     self.layers.append(layer_data)
+                if isinstance(module, nn.Conv3d):
+                    layer_data = self.rename_Conv3d(node, module)
+                    self.layers.append(layer_data)
                 elif isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d)):
                     layer_data = self.rename_BatchNormalization(node, module)
                     self.layers.append(layer_data[0])
                     self.layers.append(layer_data[1])
+                elif isinstance(module, (nn.InstanceNorm2d, nn.InstanceNorm3d)):
+                    layer_data = self.rename_InstanceNorm(node, module)
+                    self.layers.append(layer_data)
                 elif isinstance(module, nn.ReLU):
                     layer_data = self.rename_ReLU(node)
                     self.layers.append(layer_data)
                 elif isinstance(module, nn.MaxPool2d):
                     layer_data = self.rename_MaxPool2d(node, module)
+                    self.layers.append(layer_data)
+                elif isinstance(module, nn.MaxPool3d):
+                    layer_data = self.rename_MaxPool3d(node, module)
                     self.layers.append(layer_data)
                 elif isinstance(module, nn.AdaptiveAvgPool2d):
                     if isinstance(module.output_size, int):
@@ -406,8 +420,6 @@ class PytorchCaffeParser:
             else:
                 raise NotImplementedError("op type %s is not implemented" % (node.op))
 
-        text_net = pb2.NetParameter()
-        binary_weights = pb2.NetParameter()
         binary_weights.CopyFrom(text_net)
 
         for layer in self.layers:
@@ -430,17 +442,40 @@ class PytorchCaffeParser:
         prototxt = self.dest_path + ".prototxt"
         caffemodel = self.dest_path + ".caffemodel"
 
-        self.net = caffe.Net(prototxt, caffe.TEST, weights=caffemodel)
+        ppl_dir = './ppl_dir'
+        if not os.path.exists(ppl_dir):
+            os.makedirs(ppl_dir)
+        os.chdir(ppl_dir)
 
+        input_data = np.array([], np.float32)
         if isinstance(self.inputs, (tuple, list)):
             for idx, _ in enumerate(self.inputs):
                 img = self.inputs[idx].numpy()
-                self.net.blobs[self.net.inputs[idx]].data[...] = img
+                input_data = np.append(input_data, img.reshape(-1))
         else:
             img = self.inputs[0].numpy()
-            self.net.blobs[self.net.inputs[0]].data[...] = img
+            input_data = np.append(input_data, img.reshape(-1))
+        input_data.tofile("input.bin")
 
-        self.caffe_output = self.net.forward()
+        rm_cmd = "rm ./*dat"
+        down_cmd = "wget http://ppl.sensetime.com/shared/packages/GitLab-CI/PPLv3/release/v1.13.1.e8a248a41d48e8991ad92844363432d7eaa209cf.728034/linux-x86_64+cuda11_1/gcc-stdc++/5.4/Release/pkg.zip"
+        unzip_cmd = "unzip ./pkg.zip"
+        binary_path = "."
+        if os.path.exists("/mnt/hpc/share/wjf/PPLBinaries/PPLV3-CUDA-1131/pkg.zip"):
+            down_cmd = ""
+            unzip_cmd = ""
+            binary_path = "/mnt/hpc/share/wjf/PPLBinaries/PPLV3-CUDA-1131"
+        pplc_cmd = "{}/bin/pplc --use-cuda -proto-txt ../{} -model ../{}".format(binary_path, prototxt, caffemodel)
+        pplr_cmd = "{}/bin/pplr -model ./pplmodel -input ./input.bin --save-output".format(binary_path)
+        cmds = [rm_cmd, down_cmd, unzip_cmd, pplc_cmd, pplr_cmd]
+        for cmd in cmds:
+            os.system(cmd)
+        f_list = os.listdir(".")
+        import re
+        self.caffe_output = []
+        for fl in f_list:
+            if re.search("ppl3_output-", fl):
+                self.caffe_output.append(np.fromfile(fl, np.float32))
 
     def check_result(self):
         self.pyotrch_inference()
@@ -454,8 +489,8 @@ class PytorchCaffeParser:
 
         for idx in range(len(self.caffe_output)):
             np.testing.assert_allclose(
-                self.caffe_output[self.net.outputs[idx]],
-                self.pytorch_output[idx].detach().numpy(),
+                self.caffe_output[idx],
+                self.pytorch_output[idx].detach().numpy().reshape(-1),
                 rtol=1e-7,
                 atol=1e-3,
             )
@@ -471,54 +506,75 @@ class PytorchCaffeParser:
             enable_onnx_checker=False,
         )
 
-    def rename_Data(self, source_node):
-        layer = pb2.LayerParameter()
-        layer.type = "Input"
+    def rename_Data(self, source_node, text_net):
+        text_net.input.append(source_node.name)
         input_shape = pb2.BlobShape()
         input_shape.dim.extend(source_node.meta["tensor_meta"]["shape"])
-        layer.input_param.shape.extend([input_shape])
-        layer.top.append(source_node.name)
-        layer.name = source_node.name
-        return layer
+        text_net.input_shape.append(input_shape)
+
+    def add_inputs(self):
+        inps = [inp for inp in self.graph.input if inp not in self.graph.initializer]
+        self.caffe_net.input.extend(inps)
+        for inp in inps:
+            inp_shape = pb2.BlobShape()
+            input_shape.dim.extend(source_node.meta["tensor_meta"]["shape"])
+            inp_shape.dim.extend(self.graph.get_tensor_shape(inp))
+
+    def add_input_layers(self):
+        for ipt in self.graph.network_inputs:
+            ipt_layer = self.caffe_net.layer.add()
+            ipt_layer.name = ipt
+            ipt_layer.type = "Input"
+            ipt_layer.top[:] = [ipt]
+            inp_shape = ipt_layer.input_param.shape.add()
+            inp_shape.dim[:] = self.graph.get_tensor_shape(ipt)
 
     def rename_Conv(self, source_node, module):
         layer = pb2.LayerParameter()
         layer.type = "Convolution"
 
-        layer.convolution_param.dilation.extend([module.dilation[0]])
-
+        dilation = module.dilation
         kernel_size = module.kernel_size
         stride = module.stride
         padding = module.padding
         dilation = module.dilation
         groups = module.groups
 
+        if isinstance(dilation, tuple):
+            if dilation[0] == dilation[1]:
+                layer.convolution_param.hole = dilation[0]
+            else:
+                layer.convolution_param.hole_h = dilation[0]
+                layer.convolution_param.hole_w = dilation[1]
+        else:
+            layer.convolution_param.hole = dilation
+
         if isinstance(padding, tuple):
             if padding[0] == padding[1]:
-                layer.convolution_param.pad.extend([padding[0]])
+                layer.convolution_param.pad = padding[0]
             else:
                 layer.convolution_param.pad_h = padding[0]
                 layer.convolution_param.pad_w = padding[1]
         else:
-            layer.convolution_param.pad.extend([padding])
+            layer.convolution_param.pad = padding
 
         if isinstance(stride, tuple):
             if stride[0] == stride[1]:
-                layer.convolution_param.stride.extend([stride[0]])
+                layer.convolution_param.stride = stride[0]
             else:
                 layer.convolution_param.stride_h = stride[0]
                 layer.convolution_param.stride_w = stride[1]
         else:
-            layer.convolution_param.stride.extend([stride])
+            layer.convolution_param.stride = stride
 
         if isinstance(kernel_size, tuple):
             if kernel_size[0] == kernel_size[1]:
-                layer.convolution_param.kernel_size.extend([kernel_size[0]])
+                layer.convolution_param.kernel_size = kernel_size[0]
             else:
                 layer.convolution_param.kernel_h = kernel_size[0]
                 layer.convolution_param.kernel_w = kernel_size[1]
         else:
-            layer.convolution_param.kernel_size.extend([kernel_size])
+            layer.convolution_param.kernel_size = kernel_size
 
         layer.convolution_param.group = groups
 
@@ -536,6 +592,76 @@ class PytorchCaffeParser:
 
         self.add_bottom_top(layer, source_node)
 
+        return layer
+
+    def rename_Conv3d(self, source_node, module):
+        layer = pb2.LayerParameter()
+        layer.type = "Convolution3d"
+
+        dilation = module.dilation
+        kernel_size = module.kernel_size
+        stride = module.stride
+        padding = module.padding
+        dilation = module.dilation
+        groups = module.groups
+
+        if isinstance(dilation, tuple):
+            if dilation[0] == dilation[1] and dilation[1] == dilation[2]:
+                layer.convolution3d_param.hole = dilation[0]
+            else:
+                layer.convolution3d_param.hole_d = dilation[0]
+                layer.convolution3d_param.hole_h = dilation[1]
+                layer.convolution3d_param.hole_w = dilation[2]
+        else:
+            layer.convolution3d_param.hole = dilation
+
+        if isinstance(padding, tuple):
+            if padding[0] == padding[1] and padding[1] == padding[2]:
+                layer.convolution3d_param.pad = padding[0]
+            else:
+                layer.convolution3d_param.pad_d = padding[0]
+                layer.convolution3d_param.pad_h = padding[1]
+                layer.convolution3d_param.pad_w = padding[2]
+        else:
+            layer.convolution3d_param.pad = padding
+
+        if isinstance(stride, tuple):
+            if stride[0] == stride[1] and stride[1] == stride[2]:
+                layer.convolution3d_param.stride = stride[0]
+            else:
+                layer.convolution3d_param.stride_d = stride[0]
+                layer.convolution3d_param.stride_h = stride[1]
+                layer.convolution3d_param.stride_w = stride[2]
+        else:
+            layer.convolution3d_param.stride = stride
+
+        if isinstance(kernel_size, tuple):
+            if kernel_size[0] == kernel_size[1] and kernel_size[1] == kernel_size[2]:
+                layer.convolution3d_param.kernel_size = kernel_size[0]
+            else:
+                layer.convolution3d_param.kernel_d = kernel_size[0]
+                layer.convolution3d_param.kernel_h = kernel_size[1]
+                layer.convolution3d_param.kernel_w = kernel_size[2]
+        else:
+            layer.convolution3d_param.kernel_size = kernel_size
+
+        layer.convolution3d_param.group = groups
+
+        weight = module.weight.detach().numpy()
+
+        layer.convolution3d_param.num_output = module.out_channels
+
+        if module.bias is not None:
+            bias = module.bias.detach().numpy()
+            layer.convolution3d_param.bias_term = True
+            layer.blobs.extend([as_blob(weight), as_blob(bias)])
+        else:
+            layer.convolution3d_param.bias_term = False
+            layer.blobs.extend([as_blob(weight)])
+
+        self.add_bottom_top(layer, source_node)
+
+        self.whether_3dnet = True
         return layer
 
     def rename_AdaptiveAvgPool2d(self, source_node):
@@ -598,9 +724,23 @@ class PytorchCaffeParser:
 
         return layer_bn, layer_scale
 
+    def rename_InstanceNorm(self, source_node, module):
+        layer_in = pb2.LayerParameter()
+        layer_in.type = "InstanceNorm"
+
+        layer_in.instance_norm_param.affine = module.affine
+        layer_in.instance_norm_param.eps = module.eps
+        layer_in.instance_norm_param.num_features = module.num_features
+
+        self.add_bottom_top(layer_in, source_node)
+
+        return layer_in
+
     def rename_ReLU(self, source_node):
         layer = pb2.LayerParameter()
         layer.type = "ReLU"
+        if self.whether_3dnet:
+            layer.type = "ReLU3d"
 
         self.add_bottom_top(layer, source_node)
 
@@ -640,6 +780,50 @@ class PytorchCaffeParser:
             layer.pooling_param.kernel_size = module.kernel_size
 
         layer.pooling_param.ceil_mode = module.ceil_mode
+        layer.pooling_param.global_pooling = False
+
+        self.add_bottom_top(layer, source_node)
+
+        return layer
+
+    def rename_MaxPool3d(self, source_node, module):
+        layer = pb2.LayerParameter()
+        layer.type = "Pooling3d"
+
+        layer.pooling3d_param.pool = pb2.PoolingParameter.MAX
+
+        if isinstance(module.padding, tuple):
+            if module.padding[0] == module.padding[1] and module.padding[1] == module.padding[2]:
+                layer.pooling3d_param.pad = module.padding[0]
+            else:
+                layer.pooling3d_param.pad_d = module.padding[0]
+                layer.pooling3d_param.pad_h = module.padding[1]
+                layer.pooling3d_param.pad_w = module.padding[2]
+        else:
+            layer.pooling3d_param.pad = module.padding
+
+        if isinstance(module.stride, tuple):
+            if module.stride[0] == module.stride[1] and module.stride[1] == module.stride[2]:
+                layer.pooling3d_param.stride = module.stride[0]
+            else:
+                layer.pooling3d_param.stride_d = module.stride[0]
+                layer.pooling3d_param.stride_h = module.stride[1]
+                layer.pooling3d_param.stride_w = module.stride[2]
+        else:
+            layer.pooling3d_param.stride = module.stride
+
+        if isinstance(module.kernel_size, tuple):
+            if module.kernel_size[0] == module.kernel_size[1] and module.kernel_size[1] == module.kernel_size[2]:
+                layer.pooling3d_param.kernel_size = module.kernel_size[0]
+            else:
+                layer.pooling3d_param.kernel_d = module.kernel_size[0]
+                layer.pooling3d_param.kernel_h = module.kernel_size[1]
+                layer.pooling3d_param.kernel_w = module.kernel_size[2]
+        else:
+            layer.pooling3d_param.kernel_size = module.kernel_size
+
+        layer.pooling3d_param.ceil_mode = module.ceil_mode
+        layer.pooling3d_param.global_pooling = False
 
         self.add_bottom_top(layer, source_node)
 
@@ -753,9 +937,12 @@ class PytorchCaffeParser:
 
     def rename_Dropout(self, source_node, module):
         layer = pb2.LayerParameter()
-        layer.type = "Dropout"
-
-        layer.dropout_param.dropout_ratio = module.p
+        if self.whether_3dnet:
+            layer.type = "Dropout3d"
+            layer.dropout3d_param.dropout_ratio = module.p
+        else:
+            layer.type = "Dropout"
+            layer.dropout_param.dropout_ratio = module.p
 
         self.add_bottom_top(layer, source_node)
 
@@ -775,9 +962,21 @@ class PytorchCaffeParser:
 
     def rename_Upsample(self, source_node, module=None):
         layer = pb2.LayerParameter()
-        layer.type = "Upsample"
-
-        layer.upsample_param.scale = int(module.scale_factor)
+        if module.mode == "nearest":
+            layer.type = "NNUpsample"
+            layer.nn_upsample_param.resize = int(module.scale_factor)
+        elif self.whether_3dnet and module.mode == "trilinear":
+            layer.type = "Interp3d"
+            layer.interp3d_param.zoom_factor = int(module.scale_factor)
+            layer.interp3d_param.align_corners = module.align_corners
+            layer.interp3d_param.backend = pb2.Interp3dParameter.ModeType.pytorch
+        elif module.mode == "bilinear":
+            layer.type = "Interp"
+            layer.interp_param.zoom_factor = int(module.scale_factor)
+            layer.interp_param.align_corners = module.align_corners
+            layer.interp_param.backend = pb2.InterpParameter.ModeType.pytorch
+        else:
+            assert 0, "Upsample convert failed!"
 
         self.add_bottom_top(layer, source_node)
 
@@ -795,12 +994,19 @@ class PytorchCaffeParser:
 
     def rename_Cat(self, source_node):
         layer = pb2.LayerParameter()
-        layer.type = "Concat"
 
+        axis = 1
         if "dim" in source_node.kwargs:
-            layer.concat_param.axis = source_node.kwargs["dim"]
+            axis = source_node.kwargs["dim"]
         else:
-            layer.concat_param.axis = source_node.args[1]
+            axis = source_node.args[1]
+
+        if self.whether_3dnet:
+            layer.type = "Concat3d"
+            layer.concat3d_param.axis = axis
+        else:
+            layer.type = "Concat"
+            layer.concat_param.axis = axis
 
         self.add_bottom_top(layer, source_node)
 
@@ -1007,12 +1213,18 @@ class PytorchCaffeParser:
 
     def rename_cat(self, source_node):
         layer = pb2.LayerParameter()
-        layer.type = "Concat"
-
+        axis = 1
         if "dim" in source_node.kwargs:
-            layer.concat_param.axis = source_node.kwargs["dim"]
+            axis = source_node.kwargs["dim"]
         else:
-            layer.concat_param.axis = source_node.args[1]
+            axis = source_node.args[1]
+
+        if self.whether_3dnet:
+            layer.type = "Concat3d"
+            layer.concat3d_param.axis = axis
+        else:
+            layer.type = "Concat"
+            layer.concat_param.axis = axis
 
         self.add_bottom_top(layer, source_node)
 
@@ -1478,39 +1690,47 @@ class PytorchCaffeParser:
         layer = pb2.LayerParameter()
         layer.type = "Deconvolution"
 
-        layer.convolution_param.dilation.extend([module.dilation[0]])
-
+        dilation = module.dilation
         kernel_size = module.kernel_size
         stride = module.stride
         padding = module.padding
         groups = module.groups
 
+        if isinstance(dilation, tuple):
+            if dilation[0] == dilation[1]:
+                layer.convolution_param.hole = dilation[0]
+            else:
+                layer.convolution_param.hole_h = dilation[0]
+                layer.convolution_param.hole_w = dilation[1]
+        else:
+            layer.convolution_param.hole = dilation
+
         if isinstance(padding, tuple):
             if padding[0] == padding[1]:
-                layer.convolution_param.pad.extend([padding[0]])
+                layer.convolution_param.pad = padding[0]
             else:
                 layer.convolution_param.pad_h = padding[0]
                 layer.convolution_param.pad_w = padding[1]
         else:
-            layer.convolution_param.pad.extend([padding])
+            layer.convolution_param.pad = padding
 
         if isinstance(stride, tuple):
             if stride[0] == stride[1]:
-                layer.convolution_param.stride.extend([stride[0]])
+                layer.convolution_param.stride = stride[0]
             else:
                 layer.convolution_param.stride_h = stride[0]
                 layer.convolution_param.stride_w = stride[1]
         else:
-            layer.convolution_param.stride.extend([stride])
+            layer.convolution_param.stride = stride
 
         if isinstance(kernel_size, tuple):
             if kernel_size[0] == kernel_size[1]:
-                layer.convolution_param.kernel_size.extend([kernel_size[0]])
+                layer.convolution_param.kernel_size = kernel_size[0]
             else:
                 layer.convolution_param.kernel_h = kernel_size[0]
                 layer.convolution_param.kernel_w = kernel_size[1]
         else:
-            layer.convolution_param.kernel_size.extend([kernel_size])
+            layer.convolution_param.kernel_size = kernel_size
 
         layer.convolution_param.group = groups
 
