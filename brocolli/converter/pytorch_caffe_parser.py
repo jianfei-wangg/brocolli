@@ -237,6 +237,9 @@ class PytorchCaffeParser:
                 elif isinstance(module, nn.ConvTranspose2d):
                     layer_data = self.rename_ConvTranspose(node, module)
                     self.layers.append(layer_data)
+                elif isinstance(module, nn.ConvTranspose3d):
+                    layer_data = self.rename_ConvTranspose3d(node, module)
+                    self.layers.append(layer_data)
                 elif isinstance(module, nn.Sigmoid):
                     layer_data = self.rename_sigmoid(node)
                     self.layers.append(layer_data)
@@ -458,13 +461,13 @@ class PytorchCaffeParser:
         input_data.tofile("input.bin")
 
         rm_cmd = "rm ./*dat"
-        down_cmd = "wget http://ppl.sensetime.com/shared/packages/GitLab-CI/PPLv3/release/v1.13.1.e8a248a41d48e8991ad92844363432d7eaa209cf.728034/linux-x86_64+cuda11_1/gcc-stdc++/5.4/Release/pkg.zip"
+        down_cmd = "wget http://ppl.sensetime.com/shared/packages/GitLab-CI/PPLv3/wjf/develop.2d70805c3fbff4163661e07bd4ef1410056913f2.755276/linux-x86_64+cuda11_1/gcc-stdc++/5.4/Release/pkg.zip"
         unzip_cmd = "unzip ./pkg.zip"
         binary_path = "."
-        if os.path.exists("/mnt/hpc/share/wjf/PPLBinaries/PPLV3-CUDA-1131/pkg.zip"):
+        if os.path.exists("/mnt/hpc/share/wjf/PPLBinaries/PPLV3-CUDA-CARE/pkg.zip"):
             down_cmd = ""
             unzip_cmd = ""
-            binary_path = "/mnt/hpc/share/wjf/PPLBinaries/PPLV3-CUDA-1131"
+            binary_path = "/mnt/hpc/share/wjf/PPLBinaries/PPLV3-CUDA-CARE"
         pplc_cmd = "{}/bin/pplc --use-cuda -proto-txt ../{} -model ../{}".format(binary_path, prototxt, caffemodel)
         pplr_cmd = "{}/bin/pplr -model ./pplmodel -input ./input.bin --save-output".format(binary_path)
         cmds = [rm_cmd, down_cmd, unzip_cmd, pplc_cmd, pplr_cmd]
@@ -731,6 +734,14 @@ class PytorchCaffeParser:
         layer_in.instance_norm_param.affine = module.affine
         layer_in.instance_norm_param.eps = module.eps
         layer_in.instance_norm_param.num_features = module.num_features
+
+        if module.affine:
+            weight = module.weight.detach().numpy()
+            if module.bias is not None:
+                bias = module.bias.detach().numpy()
+                layer_in.blobs.extend([as_blob(weight), as_blob(bias)])
+            else:
+                layer_in.blobs.extend([as_blob(weight)])
 
         self.add_bottom_top(layer_in, source_node)
 
@@ -1132,9 +1143,12 @@ class PytorchCaffeParser:
 
     def rename_LeakyRelu(self, source_node, module):
         layer = pb2.LayerParameter()
-        layer.type = "ReLU"
-
-        layer.relu_param.negative_slope = module.negative_slope
+        if self.whether_3dnet:
+            layer.type = "LeakyReLU3d"
+            layer.leaky_relu3d_param.negative_slope = module.negative_slope
+        else:
+            layer.type = "ReLU"
+            layer.relu_param.negative_slope = module.negative_slope
 
         self.add_bottom_top(layer, source_node)
 
@@ -1376,15 +1390,22 @@ class PytorchCaffeParser:
 
     def rename_softmax(self, source_node):
         layer = pb2.LayerParameter()
-        layer.type = "Softmax"
 
-        dim = source_node.kwargs["dim"]
+        if "dim" in source_node.kwargs.keys():
+            dim = source_node.kwargs["dim"]
+        else:
+            dim = None
         if dim is None:
             stacklevel = 3
             shape = source_node.args[0].meta["tensor_meta"]["shape"]
             dim = F._get_softmax_dim("softmax", len(shape), stacklevel)
 
-        layer.softmax_param.axis = dim
+        if self.whether_3dnet:
+            layer.type = "Softmax3d"
+            layer.softmax3d_param.axis = dim
+        else:
+            layer.type = "Softmax"
+            layer.softmax_param.axis = dim
 
         self.add_bottom_top(layer, source_node)
 
@@ -1744,6 +1765,85 @@ class PytorchCaffeParser:
             layer.blobs.extend([as_blob(weight), as_blob(bias)])
         else:
             layer.convolution_param.bias_term = False
+            layer.blobs.extend([as_blob(weight)])
+
+        self.add_bottom_top(layer, source_node)
+
+        return layer
+    
+    def rename_ConvTranspose3d(self, source_node, module):
+        layer = pb2.LayerParameter()
+        layer.type = "Deconvolution3d"
+
+        dilation = module.dilation
+        kernel_size = module.kernel_size
+        stride = module.stride
+        padding = module.padding
+        out_padding = module.output_padding
+        groups = module.groups
+
+        if isinstance(dilation, tuple):
+            if dilation[0] == dilation[1] and dilation[1] == dilation[2]:
+                layer.deconvolution3d_param.hole = dilation[0]
+            else:
+                layer.deconvolution3d_param.hole_d = dilation[0]
+                layer.deconvolution3d_param.hole_h = dilation[1]
+                layer.deconvolution3d_param.hole_w = dilation[2]
+        else:
+            layer.deconvolution3d_param.hole = dilation
+
+        if isinstance(padding, tuple):
+            if padding[0] == padding[1] and padding[1] == padding[2]:
+                layer.deconvolution3d_param.pad = padding[0]
+            else:
+                layer.deconvolution3d_param.pad_d = padding[0]
+                layer.deconvolution3d_param.pad_h = padding[1]
+                layer.deconvolution3d_param.pad_w = padding[2]
+        else:
+            layer.deconvolution3d_param.pad = padding
+
+        if isinstance(out_padding, tuple):
+            if out_padding[0] == out_padding[1] and out_padding[1] == out_padding[2]:
+                layer.deconvolution3d_param.out_pad = out_padding[0]
+            else:
+                layer.deconvolution3d_param.out_pad_d = out_padding[0]
+                layer.deconvolution3d_param.out_pad_h = out_padding[1]
+                layer.deconvolution3d_param.out_pad_w = out_padding[2]
+        else:
+            layer.deconvolution3d_param.out_pad = out_padding
+
+        if isinstance(stride, tuple):
+            if stride[0] == stride[1] and stride[1] == stride[2]:
+                layer.deconvolution3d_param.stride = stride[0]
+            else:
+                layer.deconvolution3d_param.stride_d = stride[0]
+                layer.deconvolution3d_param.stride_h = stride[1]
+                layer.deconvolution3d_param.stride_w = stride[2]
+        else:
+            layer.deconvolution3d_param.stride = stride
+
+        if isinstance(kernel_size, tuple):
+            if kernel_size[0] == kernel_size[1] and kernel_size[1] == kernel_size[2]:
+                layer.deconvolution3d_param.kernel_size = kernel_size[0]
+            else:
+                layer.deconvolution3d_param.kernel_d = kernel_size[0]
+                layer.deconvolution3d_param.kernel_h = kernel_size[1]
+                layer.deconvolution3d_param.kernel_w = kernel_size[2]
+        else:
+            layer.deconvolution3d_param.kernel_size = kernel_size
+
+        layer.deconvolution3d_param.group = groups
+
+        weight = module.weight.detach().numpy()
+
+        layer.deconvolution3d_param.num_output = module.out_channels
+
+        if module.bias is not None:
+            bias = module.bias.detach().numpy()
+            layer.deconvolution3d_param.bias_term = True
+            layer.blobs.extend([as_blob(weight), as_blob(bias)])
+        else:
+            layer.deconvolution3d_param.bias_term = False
             layer.blobs.extend([as_blob(weight)])
 
         self.add_bottom_top(layer, source_node)
