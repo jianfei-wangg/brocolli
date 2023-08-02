@@ -145,6 +145,16 @@ class PytorchCaffeParser:
         layer.top.append(source_node.name)
         layer.name = source_node.name
 
+    def remove_layer(self, bottom=None):
+        for layer in self.layers:
+            if bottom is not None and bottom in layer.top:
+                pre_bottom = layer.bottom[0]
+                self.layers.remove(layer)
+                for pre_layer in self.layers:
+                    if pre_bottom is not None and pre_bottom in pre_layer.top:
+                        self.layers.remove(pre_layer)
+                        return pre_layer
+
     def gen_ir(self):
         text_net = pb2.NetParameter()
         binary_weights = pb2.NetParameter()
@@ -165,6 +175,9 @@ class PytorchCaffeParser:
                     layer_data = self.rename_BatchNormalization(node, module)
                     self.layers.append(layer_data[0])
                     self.layers.append(layer_data[1])
+                elif isinstance(module, nn.BatchNorm3d):
+                    layer_data = self.rename_BatchNormalization3d(node, module)
+                    self.layers.append(layer_data)
                 elif isinstance(module, (nn.InstanceNorm2d, nn.InstanceNorm3d)):
                     layer_data = self.rename_InstanceNorm(node, module)
                     self.layers.append(layer_data)
@@ -321,6 +334,9 @@ class PytorchCaffeParser:
                                     ]
                                     layer_data = self.rename_Slice(node, params_slice)
                                     self.layers.append(layer_data)
+                    else:
+                        layer_data = self.rename_getitem(node) #fist add, last remove
+                        self.layers.append(layer_data)
                 elif function_name == "floordiv":
                     pass
                 elif function_name == "transpose":
@@ -371,8 +387,9 @@ class PytorchCaffeParser:
                 elif function_name == "abs":
                     layer_data = self.rename_abs(node)
                     self.layers.append(layer_data)
-                elif function_name == "getattr":
-                    pass
+                elif function_name == "getattr": # first add, last remove
+                    layer_data = self.rename_getattr(node)
+                    self.layers.append(layer_data)
                 elif function_name == "interpolate":
                     layer_data = self.rename_interpolate(node)
                     self.layers.append(layer_data)
@@ -433,6 +450,7 @@ class PytorchCaffeParser:
             del layer_proto.blobs[:]
             text_net.layer.extend([layer_proto])
 
+        # print(text_net)
         return text_net, binary_weights
 
     def pyotrch_inference(self, generate_onnx=False):
@@ -479,6 +497,7 @@ class PytorchCaffeParser:
         for fl in f_list:
             if re.search("ppl3_output-", fl):
                 self.caffe_output.append(np.fromfile(fl, np.float32))
+        # self.caffe_output = [self.caffe_output[-1], self.caffe_output[0]]
 
     def check_result(self):
         self.pyotrch_inference()
@@ -726,6 +745,35 @@ class PytorchCaffeParser:
         layer_scale.name = source_node.name
 
         return layer_bn, layer_scale
+
+    def rename_BatchNormalization3d(self, source_node, module):
+        layer_bn = pb2.LayerParameter()
+
+        weight = module.weight.detach().numpy()
+        bias = module.bias.detach().numpy()
+        mean = module.running_mean.detach().numpy()
+        variance = module.running_var.detach().numpy()
+
+        # if module.track_running_stats:
+        if False:
+            layer_bn.bn3d_param.moving_average = False
+            layer_bn.bn3d_param.var_eps = module.eps
+            layer_bn.bn3d_param.decay = module.momentum
+            layer_bn.type = "BN3d"
+            layer_bn.blobs.extend(
+                [as_blob(weight), as_blob(bias), as_blob(mean), as_blob(variance)]
+            )
+        else:
+            layer_bn.batchnorm3d_param.use_global_stats = True
+            layer_bn.type = "BatchNorm3d"
+            layer_bn.batchnorm3d_param.eps = module.eps
+            layer_bn.blobs.extend(
+                [as_blob(weight), as_blob(bias), as_blob(mean), as_blob(variance)]
+            )
+
+        self.add_bottom_top(layer_bn, source_node)
+
+        return layer_bn
 
     def rename_InstanceNorm(self, source_node, module):
         layer_in = pb2.LayerParameter()
@@ -995,11 +1043,43 @@ class PytorchCaffeParser:
 
     def rename_interpolate(self, source_node, module=None):
         layer = pb2.LayerParameter()
-        layer.type = "Upsample"
 
-        layer.upsample_param.scale = int(source_node.kwargs["scale_factor"])
-
+        use_factor = True
         self.add_bottom_top(layer, source_node)
+        for idx in range(len(source_node.kwargs["size"])):
+            item = source_node.kwargs["size"][idx].name
+            bottom_layer = self.remove_layer(item)
+        if len(bottom_layer.bottom) > 0:
+            use_factor = False
+            layer.bottom.append(bottom_layer.bottom[0])
+
+        scale_factor = 1
+        if isinstance(source_node.kwargs["scale_factor"], tuple):
+            scale_factor = source_node.kwargs["scale_factor"][0]
+        elif source_node.kwargs["scale_factor"] is not None:
+            scale_factor = int(source_node.kwargs["scale_factor"])
+
+        mode = source_node.kwargs["mode"]
+        align_corners = source_node.kwargs["align_corners"]
+        if mode == "nearest":
+            layer.type = "NNUpsample"
+            layer.nn_upsample_param.resize = int(scale_factor)
+        elif self.whether_3dnet and mode == "trilinear":
+            layer.type = "Interp3d"
+            if use_factor:
+                layer.interp3d_param.zoom_factor = int(scale_factor)
+            layer.interp3d_param.align_corners = align_corners
+            layer.interp3d_param.backend = pb2.Interp3dParameter.ModeType.pytorch
+        elif mode == "bilinear":
+            layer.type = "Interp"
+            if use_factor:
+                layer.interp_param.zoom_factor = int(scale_factor)
+            layer.interp_param.align_corners = module.align_corners
+            layer.interp_param.backend = pb2.InterpParameter.ModeType.pytorch
+        else:
+            assert 0, "Interpolate convert failed!"
+
+        
 
         return layer
 
@@ -1194,6 +1274,8 @@ class PytorchCaffeParser:
     def rename_relu(self, source_node):
         layer = pb2.LayerParameter()
         layer.type = "ReLU"
+        if self.whether_3dnet:
+            layer.type = "ReLU3d"
 
         self.add_bottom_top(layer, source_node)
 
@@ -1220,6 +1302,22 @@ class PytorchCaffeParser:
     def rename_abs(self, source_node):
         layer = pb2.LayerParameter()
         layer.type = "AbsVal"
+
+        self.add_bottom_top(layer, source_node)
+
+        return layer
+
+    def rename_getattr(self, source_node):
+        layer = pb2.LayerParameter()
+        layer.type = "GetAttr"
+
+        self.add_bottom_top(layer, source_node)
+
+        return layer
+
+    def rename_getitem(self, source_node):
+        layer = pb2.LayerParameter()
+        layer.type = "GetItem"
 
         self.add_bottom_top(layer, source_node)
 
